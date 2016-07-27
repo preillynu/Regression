@@ -13,16 +13,55 @@
 #include <string>
 #include <cmath>
 #include <Windows.h>
-using namespace std;
 
+using namespace std;
 
 //Set grid and block size for the kernels that run and sets the number of neighbors desired
 float minAlpha = 0.01;
 int maxIter = 150;
+int maxIter2 = 150;
 float setWeight = 1.0;
+
+int blockSize = 1024;
+int blockSide = 1024;
+
+
 
 float sigmoid(float in){
 	return 1.0 / (1 + exp(-1 * in));
+}
+
+__global__ void MatrixMultiplyKernel(float *A, float *B, float *C, int rows, int cols, int k, float alpha, float beta)
+{
+	int idx = threadIdx.x + blockIdx.x * blockDim.x;
+	int idy = threadIdx.y + blockIdx.y*blockDim.y;
+
+	if ((idx < cols) && (idy < rows)){
+		float sum = 0.0;
+		for (int i = 0; i < k; i++){
+			sum += A[idy*k + i] * B[idx + cols*i];
+		}
+		C[idy*cols + idx] = (C[idy*cols + idx] * beta) + alpha*sum;
+	}
+
+}
+
+__global__ void sigmoidKernel(float *Weight, int rows)
+{
+	int i = threadIdx.y + blockIdx.y * blockDim.y;
+	//Only calculate the distance if the thread corresponds to an existing element
+	if (i < rows){
+		Weight[i] = (1.0 / (1 + exp(-1 * Weight[i])));
+	}
+}
+
+__global__ void subtractKernel(float *A, float *B, int rows)
+{
+	int i = threadIdx.y + blockIdx.y * blockDim.y;
+	//Only calculate the distance if the thread corresponds to an existing element
+	if (i < rows){
+		A[i] = A[i] - B[i];
+	}
 }
 
 int main()
@@ -32,16 +71,23 @@ int main()
 
 	//The arrays that will hold the labeled data
 	float** coors;
+	float* CudaCoors;
+	float* CudaCoorsT;
 
 	//Arrays to hold the distances computed via the GPU and CPU
 	float* weights;
-
+	float* CudaWeights;
+	float* CudaH;
+	float* CudaError;
 	//An array to hold the unsorted labels
 	int* labels;
 	int* sortedlabels;
 
 	//Variables used to hold one data point
 	float* dataPoint;
+
+	//Dev Vars
+	float *devCudaWeights, *devCudaH, *devCudaError, *devCudaCoors, *devCoors;
 
 	//Variables to hold the number of labeled data points and the number or points being entered
 	int numInput;
@@ -52,7 +98,7 @@ int main()
 
 	//Opens a file whose first line is the number of elements and every subsequent line is an x coordinate, y coordinate,
 	//and label that are seperated by spaces
-	inputData.open("Synthesized_Data_100.txt");
+	inputData.open("Synthesized_Data_10000.txt");
 
 	//Make sure the file opens correctly
 	if (!inputData.is_open()){
@@ -67,25 +113,42 @@ int main()
 	cout << "How many points do you want to read? ";
 	cin >> numPoints;
 
+	//Create best Grid Size
+	int gridSize = (numInput + blockSize - 1) / blockSize;
+
+	dim3 block(1, blockSize, 1);
+	dim3 grid(1, gridSize, 1);
+
 	//Set up the arrays to have a max capacity equal to the sum of the number of labeled and unlabeled points
-	coors = new float*[numDim+1];
+	coors = new float*[numDim + 1];
+	CudaCoors = new float[numInput*(numDim +1)];
+	CudaCoorsT = new float[numInput*(numDim + 1)];
 	labels = new int[numInput + numPoints];
 	sortedlabels = new int[numDim];
 	weights = new float[numDim + 1];
-	dataPoint = new float[numDim+1];
+	CudaWeights = new float[numDim + 1];
+	CudaH = new float[numInput + numPoints];
+	CudaError = new float[numInput + numPoints];
+	dataPoint = new float[numDim + 1];
 
 	//Set up the 2D coors array for the number of dimensions each point is
-	for (int i = 0; i < numDim+1; i++){
-		coors[i] = new float[numInput + numPoints];
-		weights[i] = setWeight;
+	for (int i = 0; i < numDim + 1; i++){
+		coors[i] = new float[numInput];
+		weights[i] = ((double)rand() / (RAND_MAX));
+		CudaWeights[i] = weights[i];
 	}
-
+	
 	for (int i = 0; i < numInput; i++){
 		coors[0][i] = 1.0;
-		for (int j = 1; j < numDim+1; j++){
+		CudaCoors[i*(numDim + 1)] = 1.0;
+		CudaCoorsT[i] = 1.0;
+		for (int j = 1; j < numDim + 1; j++){
 			inputData >> coors[j][i];
+			CudaCoors[i*(numDim + 1) + j] = coors[j][i];
+			CudaCoorsT[j*numInput + i] = coors[j][i];
 		}
 		inputData >> labels[i];
+		CudaH[i] = (float)labels[i];
 	}
 
 	//Close the input file
@@ -94,18 +157,21 @@ int main()
 	//Collect the data points that the user wants classified
 	for (int i = 0; i < numPoints; i++){
 		cout << i << " data point: " << endl;
-		coors[0][i + numInput] = 0.0;
-		for (int j = 1; j < numDim+1; j++){
+		//coors[0][i + numInput] = 0.0;
+		//CudaCoors[i + numInput][0] = 0.0;
+		for (int j = 1; j < numDim + 1; j++){
 			cout << j << " dim: ";
-			cin >> coors[j][i + numInput];
+			cin >> dataPoint[i];
+			//cin >> coors[j][i + numInput];
+			//CudaCoors[i + numInput][j] = coors[j][i + numInput];
 		}
 		cout << endl;
 	}
 
 	//Get the coordinates of the point to be classified
-	for (int i = 0; i < numDim + 1; i++){
-		dataPoint[i] = coors[i][numInput];
-	}
+	//for (int i = 0; i < numDim + 1; i++){
+	//	dataPoint[i] = coors[i][numInput];
+	//}
 
 	//Number of ticks per second
 	LARGE_INTEGER frequency;
@@ -139,16 +205,20 @@ int main()
 	}
 
 	float classify = 0.0;
+
 	for (int k = 0; k < numDim + 1; k++){
 		classify += weights[k] * dataPoint[k];
 	}
+
 	classify = sigmoid(classify);
+
 	if (classify > 0.5){
 		labels[numInput] = 1;
 	}
 	else{
 		labels[numInput] = 0;
 	}
+
 	cout << "Point " << 0 << " is classified with a: " << labels[numInput] << endl;
 
 	for (int k = 0; k < numDim + 1; k++){
@@ -162,77 +232,165 @@ int main()
 	elapsedTime = (t2.QuadPart - t1.QuadPart) * 1000.0 / frequency.QuadPart;
 	cout << elapsedTime << " milliseconds for sequential run.\n" << endl;
 
-	//Run the Regression code for all extra points using online learning algorithm
-	for (int z = 1; z < numPoints; z++){
+	//Create cuBlas handles to use cuBlas
+	cublasHandle_t h;
+	cublasCreate(&h);
 
-		//Get the coordinates of the point to be classified
-		for (int i = 0; i < numDim+1; i++){
-			dataPoint[i] = coors[i][numInput + z];
-		}
-		cout << z << " data point: " << endl;
+	const float alphaCuda = 1.0f;
+	const float alphaCudaNeg = -1.0f;
+	const float varAlpha = 0.0001f;
+	const float BetaCuda = 0.0f;
 
-		//Time the sequential version using Windows's QueryPerfomanceCounter()
+	cudaMalloc((void**)&devCudaWeights, (numDim + 1)*sizeof(float));
+	cudaMalloc((void**)&devCudaH, (numInput)*sizeof(float));
+	cudaMalloc((void**)&devCudaError, (numInput)*sizeof(float));
+	cudaMalloc((void**)&devCudaCoors, (numInput*(numDim + 1))*sizeof(float));
+	cudaMalloc((void**)&devCoors, (numInput*(numDim + 1))*sizeof(float));
 
-		//Number of ticks per second
-		LARGE_INTEGER frequency;
-		//Measure times
-		LARGE_INTEGER t1, t2;
-		//Store time
-		double elapsedTime;
+	cudaMemcpy(devCudaWeights, CudaWeights, (numDim + 1)*sizeof(float), cudaMemcpyHostToDevice);
+	cudaMemcpy(devCudaH, CudaH, (numInput)*sizeof(float), cudaMemcpyHostToDevice);
+	cudaMemcpy(devCudaError, CudaH, (numInput)*sizeof(float), cudaMemcpyHostToDevice);
+	cudaMemcpy(devCoors, CudaCoorsT, (numInput*(numDim + 1))*sizeof(float), cudaMemcpyHostToDevice);
+	cudaMemcpy(devCudaCoors, CudaCoors, (numInput*(numDim + 1))*sizeof(float), cudaMemcpyHostToDevice);
 
-		//Fill the frequency variable
-		QueryPerformanceFrequency(&frequency);
+	cudaEvent_t start, stop;
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
 
-		//Get the first time
-		QueryPerformanceCounter(&t1);
+	//Start timer
+	cudaEventRecord(start);
 
-		alpha = minAlpha;
+	/*for (int i = 0; i < 150; i++){
+		cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, numInput, 1, numDim + 1, &alphaCuda, devCoors, numInput, devCudaWeights, numDim + 1, &BetaCuda, devCudaH, numInput);
+		sigmoidKernel << <grid, block >> >(devCudaH, numInput);
+		cublasSaxpy(h, numInput, &alphaCudaNeg, devCudaH, 1, devCudaError, 1);
+		cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, numDim + 1, 1, numInput, &varAlpha, devCudaCoors, numDim + 1, devCudaError, numInput, &alphaCuda, devCudaWeights, numDim + 1);
+		cudaMemcpy(devCudaError, CudaH, (numInput)*sizeof(float), cudaMemcpyHostToDevice);
+	}*/
 
-		for (int i = 0; i < numInput + z; i++){
-			float h = 0.0;
-			for (int j = 0; j < numInput + z; j++){
-				for (int k = 0; k < numDim + 1; k++){
-					h += coors[k][j]*weights[k];
-				}
-			}
-			h = sigmoid(h);
-			float error = labels[i] - h;
-			for (int k = 0; k < numDim + 1; k++){
-				weights[k] += alpha*error*coors[k][i];
-			}
-		}
+	dim3 MMBlock(1, blockSide, 1);
+	dim3 MMBlock2(1, numDim+1, 1);
+	int gridCoorX = 1;
+	int gridCoorY = (numInput + blockSide - 1) / blockSide;
+	dim3 gridCoor(gridCoorX, gridCoorY, 1);
 
-		float classify = 0.0;
-		for (int k = 0; k < numDim + 1; k++){
-			classify += weights[k] * dataPoint[k];
-		}
-		classify = sigmoid(classify);
-		if (classify > 0.5){
-			labels[numInput + z] = 1;
-		}
-		else{
-			labels[numInput + z] = 0;
-		}
-		cout << "Point " << z << " is classified with a: " << labels[numInput + z] << endl;
+	int gridCoorTranspose = (numDim + blockSide) / blockSide;
+	dim3 transposeCoorGrid = (1, gridCoorTranspose, 1);
 
-		for (int k = 0; k < numDim + 1; k++){
-			cout << "Weight " << k << " is: " << weights[k] << endl;
-		}
-		//Get the second time
-		QueryPerformanceCounter(&t2);
+	for (int i = 0; i < maxIter2; i++){
 
-		//Get the elapsed time in milliseconds
-		elapsedTime = (t2.QuadPart - t1.QuadPart) * 1000.0 / frequency.QuadPart;
-		cout << elapsedTime << " milliseconds for sequential run.\n" << endl;
-
-	
+		MatrixMultiplyKernel << <gridCoor, MMBlock >> >(devCudaCoors, devCudaWeights, devCudaH, numInput, 1, numDim + 1, 1.0, 0.0);
+		sigmoidKernel << <grid, block >> >(devCudaH, numInput);
+		subtractKernel << <grid, block >> >(devCudaError, devCudaH, numInput);
+		MatrixMultiplyKernel << <transposeCoorGrid, MMBlock2 >> >(devCoors, devCudaError, devCudaWeights, numDim + 1, 1, numInput, 0.0001, 1.0);
+		cudaMemcpy(devCudaError, CudaH, (numInput)*sizeof(float), cudaMemcpyHostToDevice);
+		cudaDeviceSynchronize();
 	}
+
+	cudaMemcpy(CudaWeights, devCudaWeights, (numDim + 1)*sizeof(float), cudaMemcpyDeviceToHost);
+
+	classify = 0.0;
+	for (int k = 0; k < numDim + 1; k++){
+		classify += CudaWeights[k] * dataPoint[k];
+	}
+	classify = sigmoid(classify);
+	if (classify > 0.5){
+		labels[numInput] = 1;
+	}
+	else{
+		labels[numInput] = 0;
+	}
+	cout << "Point " << 0 << " is classified with a: " << labels[numInput] << endl;
+
+	for (int k = 0; k < numDim + 1; k++){
+		cout << "Weight " << k << " is: " << CudaWeights[k] << endl;
+	}
+
+	//Finish timing
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+
+	float milliseconds = 0.0;
+	cudaEventElapsedTime(&milliseconds, start, stop);
+
+	cout << "GPU Version runtime: " << milliseconds << "\n";
+
+	cudaFree(devCudaWeights);
+	cudaFree(devCudaCoors);
+	cudaFree(devCoors);
+	cudaFree(devCudaH);
+	cudaFree(devCudaError);
+
+	//Run the Regression code for all extra points using online learning algorithm
+	/*for (int z = 1; z < numPoints; z++){
+
+	//Get the coordinates of the point to be classified
+	for (int i = 0; i < numDim + 1; i++){
+	dataPoint[i] = coors[i][numInput + z];
+	}
+	cout << z << " data point: " << endl;
+
+	//Time the sequential version using Windows's QueryPerfomanceCounter()
+
+	//Number of ticks per second
+	LARGE_INTEGER frequency;
+	//Measure times
+	LARGE_INTEGER t1, t2;
+	//Store time
+	double elapsedTime;
+
+	//Fill the frequency variable
+	QueryPerformanceFrequency(&frequency);
+
+	//Get the first time
+	QueryPerformanceCounter(&t1);
+
+	alpha = minAlpha;
+
+	for (int i = 0; i < numInput + z; i++){
+	float h = 0.0;
+	for (int j = 0; j < numInput + z; j++){
+	for (int k = 0; k < numDim + 1; k++){
+	h += coors[k][j] * weights[k];
+	}
+	}
+	h = sigmoid(h);
+	float error = labels[i] - h;
+	for (int k = 0; k < numDim + 1; k++){
+	weights[k] += alpha*error*coors[k][i];
+	}
+	}
+
+	float classify = 0.0;
+	for (int k = 0; k < numDim + 1; k++){
+	classify += weights[k] * dataPoint[k];
+	}
+	classify = sigmoid(classify);
+	if (classify > 0.5){
+	labels[numInput + z] = 1;
+	}
+	else{
+	labels[numInput + z] = 0;
+	}
+	cout << "Point " << z << " is classified with a: " << labels[numInput + z] << endl;
+
+	for (int k = 0; k < numDim + 1; k++){
+	cout << "Weight " << k << " is: " << weights[k] << endl;
+	}
+	//Get the second time
+	QueryPerformanceCounter(&t2);
+
+	//Get the elapsed time in milliseconds
+	elapsedTime = (t2.QuadPart - t1.QuadPart) * 1000.0 / frequency.QuadPart;
+	cout << elapsedTime << " milliseconds for sequential run.\n" << endl;
+
+	}*/
 
 	//Create an ofstream to print the data to so that it can be used as a labeled data set for another run
 	ofstream outputData;
 
 	//Open a file and make sure it is empty before writing to it
-	outputData.open("Regression_Test_Updated.txt", ios::out | ios::trunc);
+	outputData.open("Regression_Test_Updated_10000.txt", ios::out | ios::trunc);
 
 	//Make sure the file opens correctly
 	if (!outputData.is_open()){
@@ -244,8 +402,8 @@ int main()
 	outputData << (numInput + numPoints) << " " << numDim << " " << numLabel << endl;
 
 	//Print each point and its correspoding label
-	for (int i = 0; i < numInput + numPoints; i++){
-		for (int j = 1; j < numDim+1; j++){
+	for (int i = 0; i < numInput; i++){
+		for (int j = 1; j < numDim + 1; j++){
 			outputData << coors[j][i] << " " << endl;
 		}
 		outputData << labels[i] << endl;
@@ -255,13 +413,18 @@ int main()
 	outputData.close();
 
 	//Free remaining arrays
-	for (int i = 0; i < numDim+1; i++){
+	for (int i = 0; i < numDim + 1; i++){
 		free(coors[i]);
 	}
 	free(coors);
+	free(CudaCoors);
+	free(CudaCoorsT);
 	free(dataPoint);
 	free(sortedlabels);
 	free(weights);
+	free(CudaError);
+	free(CudaWeights);
+	free(CudaH);
 	free(labels);
 
 	//Pause on Windows machines to view output
