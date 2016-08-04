@@ -55,12 +55,12 @@ __global__ void sigmoidKernel(float *Weight, int rows)
 	}
 }
 
-__global__ void subtractKernel(float *A, float *B, int rows)
+__global__ void subtractKernel(float *A, float *B, float *C,int rows)
 {
 	int i = threadIdx.y + blockIdx.y * blockDim.y;
 	//Only calculate the distance if the thread corresponds to an existing element
 	if (i < rows){
-		A[i] = A[i] - B[i];
+		C[i] = A[i] - B[i];
 	}
 }
 
@@ -79,6 +79,7 @@ int main()
 	float* CudaWeights;
 	float* CudaH;
 	float* CudaError;
+
 	//An array to hold the unsorted labels
 	int* labels;
 	int* sortedlabels;
@@ -87,7 +88,7 @@ int main()
 	float* dataPoint;
 
 	//Dev Vars
-	float *devCudaWeights, *devCudaH, *devCudaError, *devCudaCoors, *devCoors;
+	float *devCudaWeights, *devCudaH, *devCudaError, *devCudaCoors, *devCoors, *devLabels;
 
 	//Variables to hold the number of labeled data points and the number or points being entered
 	int numInput;
@@ -121,7 +122,7 @@ int main()
 
 	//Set up the arrays to have a max capacity equal to the sum of the number of labeled and unlabeled points
 	coors = new float*[numDim + 1];
-	CudaCoors = new float[numInput*(numDim +1)];
+	CudaCoors = new float[numInput*(numDim + 1)];
 	CudaCoorsT = new float[numInput*(numDim + 1)];
 	labels = new int[numInput + numPoints];
 	sortedlabels = new int[numDim];
@@ -137,7 +138,7 @@ int main()
 		weights[i] = ((double)rand() / (RAND_MAX));
 		CudaWeights[i] = weights[i];
 	}
-	
+
 	for (int i = 0; i < numInput; i++){
 		coors[0][i] = 1.0;
 		CudaCoors[i*(numDim + 1)] = 1.0;
@@ -243,12 +244,14 @@ int main()
 
 	cudaMalloc((void**)&devCudaWeights, (numDim + 1)*sizeof(float));
 	cudaMalloc((void**)&devCudaH, (numInput)*sizeof(float));
+	cudaMalloc((void**)&devLabels, (numInput)*sizeof(float));
 	cudaMalloc((void**)&devCudaError, (numInput)*sizeof(float));
 	cudaMalloc((void**)&devCudaCoors, (numInput*(numDim + 1))*sizeof(float));
 	cudaMalloc((void**)&devCoors, (numInput*(numDim + 1))*sizeof(float));
 
 	cudaMemcpy(devCudaWeights, CudaWeights, (numDim + 1)*sizeof(float), cudaMemcpyHostToDevice);
 	cudaMemcpy(devCudaH, CudaH, (numInput)*sizeof(float), cudaMemcpyHostToDevice);
+	cudaMemcpy(devLabels, CudaH, (numInput)*sizeof(float), cudaMemcpyHostToDevice);
 	cudaMemcpy(devCudaError, CudaH, (numInput)*sizeof(float), cudaMemcpyHostToDevice);
 	cudaMemcpy(devCoors, CudaCoorsT, (numInput*(numDim + 1))*sizeof(float), cudaMemcpyHostToDevice);
 	cudaMemcpy(devCudaCoors, CudaCoors, (numInput*(numDim + 1))*sizeof(float), cudaMemcpyHostToDevice);
@@ -261,15 +264,15 @@ int main()
 	cudaEventRecord(start);
 
 	/*for (int i = 0; i < 150; i++){
-		cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, numInput, 1, numDim + 1, &alphaCuda, devCoors, numInput, devCudaWeights, numDim + 1, &BetaCuda, devCudaH, numInput);
-		sigmoidKernel << <grid, block >> >(devCudaH, numInput);
-		cublasSaxpy(h, numInput, &alphaCudaNeg, devCudaH, 1, devCudaError, 1);
-		cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, numDim + 1, 1, numInput, &varAlpha, devCudaCoors, numDim + 1, devCudaError, numInput, &alphaCuda, devCudaWeights, numDim + 1);
-		cudaMemcpy(devCudaError, CudaH, (numInput)*sizeof(float), cudaMemcpyHostToDevice);
+	cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, numInput, 1, numDim + 1, &alphaCuda, devCoors, numInput, devCudaWeights, numDim + 1, &BetaCuda, devCudaH, numInput);
+	sigmoidKernel << <grid, block >> >(devCudaH, numInput);
+	cublasSaxpy(h, numInput, &alphaCudaNeg, devCudaH, 1, devCudaError, 1);
+	cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, numDim + 1, 1, numInput, &varAlpha, devCudaCoors, numDim + 1, devCudaError, numInput, &alphaCuda, devCudaWeights, numDim + 1);
+	cudaMemcpy(devCudaError, CudaH, (numInput)*sizeof(float), cudaMemcpyHostToDevice);
 	}*/
 
 	dim3 MMBlock(1, blockSide, 1);
-	dim3 MMBlock2(1, numDim+1, 1);
+	dim3 MMBlock2(1, numDim + 1, 1);
 	int gridCoorX = 1;
 	int gridCoorY = (numInput + blockSide - 1) / blockSide;
 	dim3 gridCoor(gridCoorX, gridCoorY, 1);
@@ -280,10 +283,13 @@ int main()
 	for (int i = 0; i < maxIter2; i++){
 
 		MatrixMultiplyKernel << <gridCoor, MMBlock >> >(devCudaCoors, devCudaWeights, devCudaH, numInput, 1, numDim + 1, 1.0, 0.0);
+
 		sigmoidKernel << <grid, block >> >(devCudaH, numInput);
-		subtractKernel << <grid, block >> >(devCudaError, devCudaH, numInput);
+
+		subtractKernel << <grid, block >> >(devLabels, devCudaH, devCudaError, numInput);
+
 		MatrixMultiplyKernel << <transposeCoorGrid, MMBlock2 >> >(devCoors, devCudaError, devCudaWeights, numDim + 1, 1, numInput, 0.0001, 1.0);
-		cudaMemcpy(devCudaError, CudaH, (numInput)*sizeof(float), cudaMemcpyHostToDevice);
+
 		cudaDeviceSynchronize();
 	}
 
@@ -319,34 +325,28 @@ int main()
 	cudaFree(devCudaCoors);
 	cudaFree(devCoors);
 	cudaFree(devCudaH);
+	cudaFree(devLabels);
 	cudaFree(devCudaError);
 
 	//Run the Regression code for all extra points using online learning algorithm
 	/*for (int z = 1; z < numPoints; z++){
-
 	//Get the coordinates of the point to be classified
 	for (int i = 0; i < numDim + 1; i++){
 	dataPoint[i] = coors[i][numInput + z];
 	}
 	cout << z << " data point: " << endl;
-
 	//Time the sequential version using Windows's QueryPerfomanceCounter()
-
 	//Number of ticks per second
 	LARGE_INTEGER frequency;
 	//Measure times
 	LARGE_INTEGER t1, t2;
 	//Store time
 	double elapsedTime;
-
 	//Fill the frequency variable
 	QueryPerformanceFrequency(&frequency);
-
 	//Get the first time
 	QueryPerformanceCounter(&t1);
-
 	alpha = minAlpha;
-
 	for (int i = 0; i < numInput + z; i++){
 	float h = 0.0;
 	for (int j = 0; j < numInput + z; j++){
@@ -360,7 +360,6 @@ int main()
 	weights[k] += alpha*error*coors[k][i];
 	}
 	}
-
 	float classify = 0.0;
 	for (int k = 0; k < numDim + 1; k++){
 	classify += weights[k] * dataPoint[k];
@@ -373,17 +372,14 @@ int main()
 	labels[numInput + z] = 0;
 	}
 	cout << "Point " << z << " is classified with a: " << labels[numInput + z] << endl;
-
 	for (int k = 0; k < numDim + 1; k++){
 	cout << "Weight " << k << " is: " << weights[k] << endl;
 	}
 	//Get the second time
 	QueryPerformanceCounter(&t2);
-
 	//Get the elapsed time in milliseconds
 	elapsedTime = (t2.QuadPart - t1.QuadPart) * 1000.0 / frequency.QuadPart;
 	cout << elapsedTime << " milliseconds for sequential run.\n" << endl;
-
 	}*/
 
 	//Create an ofstream to print the data to so that it can be used as a labeled data set for another run
@@ -426,7 +422,7 @@ int main()
 	free(CudaWeights);
 	free(CudaH);
 	free(labels);
-
+	free(devLabels);
 	//Pause on Windows machines to view output
 	system("pause");
 	return 0;
