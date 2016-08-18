@@ -14,6 +14,8 @@
 #include <cmath>
 #include <Windows.h>
 
+
+#define BLOCKSIZE  32
 using namespace std;
 
 //Set grid and block size for the kernels that run and sets the number of neighbors desired
@@ -23,7 +25,7 @@ int maxIter2 = 150;
 float setWeight = 1.0;
 
 int blockSize = 1024;
-int blockSide = 1024;
+int blockSide = BLOCKSIZE;
 
 
 
@@ -31,20 +33,44 @@ float sigmoid(float in){
 	return 1.0 / (1 + exp(-1 * in));
 }
 
-__global__ void MatrixMultiplyKernel(float *A, float *B, float *C, int rows, int cols, int k, float alpha, float beta)
+__global__ void MatrixMultiplyKernel(float *devA, float *devB, float *devC, int rows, int cols, int k, float alpha, float beta)
 {
 	int idx = threadIdx.x + blockIdx.x * blockDim.x;
-	int idy = threadIdx.y + blockIdx.y*blockDim.y;
+	int idy = threadIdx.y + blockIdx.y * blockDim.y;
 
-	if ((idx < cols) && (idy < rows)){
-		float sum = 0.0;
-		for (int i = 0; i < k; i++){
-			sum += A[idy*k + i] * B[idx + cols*i];
+	__shared__ float tileA[BLOCKSIZE][BLOCKSIZE];
+	__shared__ float tileB[BLOCKSIZE][BLOCKSIZE];
+	float sum = 0.0;
+	int iter = 0;
+
+	do{
+		if ((idy < rows) && (threadIdx.x + BLOCKSIZE*iter < k)){
+			tileA[threadIdx.y][threadIdx.x] = devA[threadIdx.x + idy*k + BLOCKSIZE*iter];
 		}
-		C[idy*cols + idx] = (C[idy*cols + idx] * beta) + alpha*sum;
-	}
+		else {
+			tileA[threadIdx.y][threadIdx.x] = 0.0;
+		}
 
+		if ((threadIdx.y + BLOCKSIZE*iter < k) && (idx < cols)){
+			tileB[threadIdx.y][threadIdx.x] = devB[idx + (threadIdx.y + BLOCKSIZE*iter)*cols];
+		}
+		else {
+			tileB[threadIdx.y][threadIdx.x] = 0.0;
+		}
+		__syncthreads();
+
+		for (int i = 0; i < BLOCKSIZE; i++){
+			sum += tileA[threadIdx.y][i] * tileB[i][threadIdx.x];
+		}
+		iter++;
+		__syncthreads();
+	} while (BLOCKSIZE*iter < k);
+
+	if ((idy < rows) && (idx < cols)){
+		devC[idx + idy*cols] = sum * alpha + devC[idx + idy*cols] * beta;
+	}
 }
+
 
 __global__ void sigmoidKernel(float *Weight, int rows)
 {
@@ -55,7 +81,7 @@ __global__ void sigmoidKernel(float *Weight, int rows)
 	}
 }
 
-__global__ void subtractKernel(float *A, float *B, float *C,int rows)
+__global__ void subtractKernel(float *A, float *B, float *C, int rows)
 {
 	int i = threadIdx.y + blockIdx.y * blockDim.y;
 	//Only calculate the distance if the thread corresponds to an existing element
@@ -271,8 +297,8 @@ int main()
 	cudaMemcpy(devCudaError, CudaH, (numInput)*sizeof(float), cudaMemcpyHostToDevice);
 	}*/
 
-	dim3 MMBlock(1, blockSide, 1);
-	dim3 MMBlock2(1, numDim + 1, 1);
+	dim3 MMBlock(blockSide, blockSide, 1);
+	//dim3 MMBlock2(1, numDim + 1, 1);
 	int gridCoorX = 1;
 	int gridCoorY = (numInput + blockSide - 1) / blockSide;
 	dim3 gridCoor(gridCoorX, gridCoorY, 1);
@@ -288,7 +314,7 @@ int main()
 
 		subtractKernel << <grid, block >> >(devLabels, devCudaH, devCudaError, numInput);
 
-		MatrixMultiplyKernel << <transposeCoorGrid, MMBlock2 >> >(devCoors, devCudaError, devCudaWeights, numDim + 1, 1, numInput, 0.0001, 1.0);
+		MatrixMultiplyKernel << <transposeCoorGrid, MMBlock >> >(devCoors, devCudaError, devCudaWeights, numDim + 1, 1, numInput, 0.0001, 1.0);
 
 		cudaDeviceSynchronize();
 	}
@@ -422,7 +448,6 @@ int main()
 	free(CudaWeights);
 	free(CudaH);
 	free(labels);
-	free(devLabels);
 	//Pause on Windows machines to view output
 	system("pause");
 	return 0;
